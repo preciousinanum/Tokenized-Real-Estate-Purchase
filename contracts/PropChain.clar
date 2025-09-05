@@ -20,12 +20,18 @@
 (define-constant ERR_ALREADY_VOTED (err u107))
 (define-constant ERR_TRANSFER_FAILED (err u108))
 (define-constant ERR_INVALID_PERCENTAGE (err u109))
+(define-constant ERR_LISTING_NOT_FOUND (err u110))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u111))
+(define-constant ERR_LISTING_NOT_ACTIVE (err u112))
+(define-constant ERR_CANNOT_BUY_OWN_LISTING (err u113))
+(define-constant ERR_LISTING_ALREADY_EXISTS (err u114))
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var next-property-id uint u1)
 (define-data-var token-name (string-ascii 32) "PropChain")
 (define-data-var token-symbol (string-ascii 32) "PROP")
 (define-data-var token-decimals uint u6)
+(define-data-var next-listing-id uint u1)
 
 (define-map properties
   { property-id: uint }
@@ -70,6 +76,23 @@
 (define-map user-dividend-claims
   { property-id: uint, user: principal }
   { last-claimed-block: uint }
+)
+
+(define-map marketplace-listings
+  { listing-id: uint }
+  {
+    property-id: uint,
+    seller: principal,
+    token-amount: uint,
+    price-per-token: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map seller-listings
+  { property-id: uint, seller: principal }
+  { listing-id: uint }
 )
 
 (define-public (create-property (total-value uint) (total-tokens uint) (location (string-utf8 256)) (description (string-utf8 512)))
@@ -263,6 +286,123 @@
   )
 )
 
+(define-public (create-marketplace-listing (property-id uint) (token-amount uint) (price-per-token uint))
+  (let (
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+    (seller-ownership (unwrap! (map-get? property-ownership { property-id: property-id, owner: tx-sender }) ERR_INSUFFICIENT_TOKENS))
+    (listing-id (var-get next-listing-id))
+    (existing-listing (map-get? seller-listings { property-id: property-id, seller: tx-sender }))
+  )
+    (asserts! (get is-active property) ERR_PROPERTY_NOT_ACTIVE)
+    (asserts! (> token-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> price-per-token u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get token-amount seller-ownership) token-amount) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (is-none existing-listing) ERR_LISTING_ALREADY_EXISTS)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      {
+        property-id: property-id,
+        seller: tx-sender,
+        token-amount: token-amount,
+        price-per-token: price-per-token,
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set seller-listings
+      { property-id: property-id, seller: tx-sender }
+      { listing-id: listing-id }
+    )
+    
+    (var-set next-listing-id (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-public (buy-from-marketplace (listing-id uint) (token-amount uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+    (property (unwrap! (map-get? properties { property-id: (get property-id listing) }) ERR_PROPERTY_NOT_FOUND))
+    (seller-ownership (unwrap! (map-get? property-ownership { property-id: (get property-id listing), owner: (get seller listing) }) ERR_INSUFFICIENT_TOKENS))
+    (buyer-ownership (default-to { token-amount: u0 } (map-get? property-ownership { property-id: (get property-id listing), owner: tx-sender })))
+    (total-cost (* token-amount (get price-per-token listing)))
+  )
+    (asserts! (get is-active listing) ERR_LISTING_NOT_ACTIVE)
+    (asserts! (get is-active property) ERR_PROPERTY_NOT_ACTIVE)
+    (asserts! (> token-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= token-amount (get token-amount listing)) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (not (is-eq tx-sender (get seller listing))) ERR_CANNOT_BUY_OWN_LISTING)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR_INSUFFICIENT_PAYMENT)
+    (asserts! (>= (get token-amount seller-ownership) token-amount) ERR_INSUFFICIENT_TOKENS)
+    
+    (try! (stx-transfer? total-cost tx-sender (get seller listing)))
+    
+    (map-set property-ownership
+      { property-id: (get property-id listing), owner: (get seller listing) }
+      { token-amount: (- (get token-amount seller-ownership) token-amount) }
+    )
+    
+    (map-set property-ownership
+      { property-id: (get property-id listing), owner: tx-sender }
+      { token-amount: (+ (get token-amount buyer-ownership) token-amount) }
+    )
+    
+    (let ((remaining-tokens (- (get token-amount listing) token-amount)))
+      (if (is-eq remaining-tokens u0)
+        (begin
+          (map-set marketplace-listings
+            { listing-id: listing-id }
+            (merge listing { is-active: false })
+          )
+          (map-delete seller-listings { property-id: (get property-id listing), seller: (get seller listing) })
+        )
+        (map-set marketplace-listings
+          { listing-id: listing-id }
+          (merge listing { token-amount: remaining-tokens })
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-marketplace-listing (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get seller listing)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active listing) ERR_LISTING_NOT_ACTIVE)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing { is-active: false })
+    )
+    
+    (map-delete seller-listings { property-id: (get property-id listing), seller: (get seller listing) })
+    (ok true)
+  )
+)
+
+(define-public (update-listing-price (listing-id uint) (new-price-per-token uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get seller listing)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active listing) ERR_LISTING_NOT_ACTIVE)
+    (asserts! (> new-price-per-token u0) ERR_INVALID_AMOUNT)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing { price-per-token: new-price-per-token })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-name)
   (ok (var-get token-name))
 )
@@ -325,6 +465,26 @@
 
 (define-read-only (get-property-count)
   (- (var-get next-property-id) u1)
+)
+
+(define-read-only (get-marketplace-listing (listing-id uint))
+  (map-get? marketplace-listings { listing-id: listing-id })
+)
+
+(define-read-only (get-seller-listing (property-id uint) (seller principal))
+  (map-get? seller-listings { property-id: property-id, seller: seller })
+)
+
+(define-read-only (get-listing-count)
+  (- (var-get next-listing-id) u1)
+)
+
+(define-read-only (calculate-listing-total-cost (listing-id uint) (token-amount uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+  )
+    (ok (* token-amount (get price-per-token listing)))
+  )
 )
 
 (define-private (calculate-voting-power (property-id uint) (voter principal))
