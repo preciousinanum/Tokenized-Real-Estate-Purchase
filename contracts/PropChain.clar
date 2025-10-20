@@ -95,6 +95,65 @@
   { listing-id: uint }
 )
 
+(define-map transfer-history
+  { property-id: uint, transfer-id: uint }
+  {
+    from: principal,
+    to: principal,
+    token-amount: uint,
+    timestamp: uint,
+    price-per-token: uint
+  }
+)
+
+(define-map property-transfer-count
+  { property-id: uint }
+  { count: uint }
+)
+
+(define-private (get-transfer-count (property-id uint))
+  (default-to u0
+    (get count (map-get? property-transfer-count { property-id: property-id }))
+  )
+)
+
+(define-private (increment-transfer-count (property-id uint))
+  (let
+    (
+      (current-count (get-transfer-count property-id))
+      (new-count (+ current-count u1))
+    )
+    (map-set property-transfer-count
+      { property-id: property-id }
+      { count: new-count }
+    )
+    new-count
+  )
+)
+
+(define-private (record-transfer (property-id uint) (from principal) (to principal) (token-amount uint) (price-per-token uint))
+  (let
+    (
+      (transfer-id (increment-transfer-count property-id))
+    )
+    (map-set transfer-history
+      { property-id: property-id, transfer-id: transfer-id }
+      {
+        from: from,
+        to: to,
+        token-amount: token-amount,
+        timestamp: stacks-block-height,
+        price-per-token: price-per-token
+      }
+    )
+    transfer-id
+  )
+)
+
+(define-private (log-transfer (property-id uint) (from principal) (to principal) (token-amount uint) (price-per-token uint))
+  (record-transfer property-id from to token-amount price-per-token)
+)
+
 (define-public (create-property (total-value uint) (total-tokens uint) (location (string-utf8 256)) (description (string-utf8 512)))
   (let (
     (property-id (var-get next-property-id))
@@ -162,6 +221,7 @@
       { token-amount: (+ (get token-amount recipient-ownership) token-amount) }
     )
     
+    (log-transfer property-id tx-sender recipient token-amount u0)
     (ok true)
   )
 )
@@ -365,6 +425,7 @@
       )
     )
     
+    (log-transfer (get property-id listing) (get seller listing) tx-sender token-amount (get price-per-token listing))
     (ok true)
   )
 )
@@ -513,4 +574,16 @@
   )
     (> (get token-amount ownership) u0)
   )
+)
+
+(define-read-only (get-transfer-record (property-id uint) (transfer-id uint))
+  (map-get? transfer-history { property-id: property-id, transfer-id: transfer-id })
+)
+
+(define-read-only (get-total-transfers (property-id uint))
+  (ok (get-transfer-count property-id))
+)
+
+(define-read-only (get-property-transfer-count (property-id uint))
+  (ok (get-transfer-count property-id))
 )
